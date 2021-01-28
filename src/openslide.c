@@ -20,6 +20,8 @@
  */
 
 #include <config.h>
+#include <omp.h>
+#include <sys/time.h>
 
 #include "openslide-private.h"
 #include "openslide-decode-tifflike.h"
@@ -479,7 +481,7 @@ void openslide_cancel_prefetch_hint(openslide_t *osr G_GNUC_UNUSED,
   g_warning("openslide_cancel_prefetch_hint has never been implemented and should not be called");
 }
 
-static bool read_region(openslide_t *osr,
+static inline __attribute__((always_inline))bool read_region(openslide_t *osr,
 			cairo_t *cr,
 			int64_t x, int64_t y,
 			int32_t level,
@@ -559,7 +561,6 @@ void openslide_read_region(openslide_t *osr,
 			   int32_t level,
 			   int64_t w, int64_t h) {
   GError *tmp_err = NULL;
-
   if (!ensure_nonnegative_dimensions(osr, w, h)) {
     return;
   }
@@ -583,46 +584,71 @@ void openslide_read_region(openslide_t *osr,
   //    amount of RAM.
   const int64_t d = 4096;
   double ds = openslide_get_level_downsample(osr, level);
-  for (int64_t row = 0; row < (h + d - 1) / d; row++) {
-    for (int64_t col = 0; col < (w + d - 1) / d; col++) {
-      // calculate surface coordinates and size
-      int64_t sx = x + col * d * ds;     // level 0 plane
-      int64_t sy = y + row * d * ds;     // level 0 plane
-      int64_t sw = MIN(w - col * d, d);  // level plane
-      int64_t sh = MIN(h - row * d, d);  // level plane
+  struct timeval start, end;
+  gettimeofday(&start, 0);
+  int quit = 0;
+  {
+    // printf("\n\t\t[C Openslide LOG]: omp_get_max_threads(): %2d\n\n", omp_get_max_threads());
+		int max_threads = 32;
+    quit += 0; // dummy
+    #pragma omp parallel for collapse(2) num_threads(max_threads)
+    for (int64_t row = 0; row < (h + d - 1) / d; row++) {
+      for (int64_t col = 0; col < (w + d - 1) / d; col++) {
+        // printf("\t\t[C Openslide OMP LOG]: Thread %d/%d row %d col %d\n", omp_get_thread_num(), max_threads, row, col);
+        // calculate surface coordinates and size
+        int64_t sx = x + col * d * ds;     // level 0 plane
+        int64_t sy = y + row * d * ds;     // level 0 plane
+        int64_t sw = MIN(w - col * d, d);  // level plane
+        int64_t sh = MIN(h - row * d, d);  // level plane
 
-      // create the cairo surface for the dest
-      cairo_surface_t *surface;
-      if (dest) {
-        surface = cairo_image_surface_create_for_data(
-                (unsigned char *) (dest + w * row * d + col * d),
-                CAIRO_FORMAT_ARGB32, sw, sh, w * 4);
-      } else {
-        // nil surface
-        surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 0, 0);
+        // create the cairo surface for the dest
+        cairo_surface_t *surface;
+        if (dest) {
+          surface = cairo_image_surface_create_for_data(
+                  (unsigned char *) (dest + w * row * d + col * d),
+                  CAIRO_FORMAT_ARGB32, sw, sh, w * 4);
+        } else {
+          // nil surface
+          surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 0, 0);
+        }
+
+        // create the cairo context
+        cairo_t *cr = cairo_create(surface);
+        cairo_surface_destroy(surface);
+
+        // paint
+        if (!read_region(osr, cr, sx, sy, level, sw, sh, &tmp_err)) {
+          fprintf(stderr, "%s", "read_region error \n");
+          cairo_destroy(cr);
+          quit = 1;
+          // goto OUT;
+        }
+
+        // done
+        if (/*quit != 1 && */!_openslide_check_cairo_status(cr, &tmp_err)) {
+          fprintf(stderr, "%s", "_openslide_check_cairo_status error \n");
+          cairo_destroy(cr);
+          quit = 1;
+          // goto OUT;
+        }
+
+        // if (quit != 1) {
+        //   cairo_destroy(cr);
+        // }
+        // if(quit){
+        //   col = (w + d - 1) / d - 1;
+        //   row = (h + d - 1) / d - 1;
+        // }
       }
-
-      // create the cairo context
-      cairo_t *cr = cairo_create(surface);
-      cairo_surface_destroy(surface);
-
-      // paint
-      if (!read_region(osr, cr, sx, sy, level, sw, sh, &tmp_err)) {
-        cairo_destroy(cr);
-        goto OUT;
-      }
-
-      // done
-      if (!_openslide_check_cairo_status(cr, &tmp_err)) {
-        cairo_destroy(cr);
-        goto OUT;
-      }
-
-      cairo_destroy(cr);
     }
   }
-
-OUT:
+  gettimeofday(&end, 0);
+  int sec = end.tv_sec - start.tv_sec;
+  int usec = end.tv_usec - start.tv_usec;
+  float t_cpu = (float)sec + ((float)usec / 100000.0f);
+  t_cpu += 0;
+  // printf("\t\t[OPENSLIDE.C LOG OMP] Openslide_read_region in openslide.c loop time (s): %.2f\n", t_cpu);
+// OUT:
   if (tmp_err) {
     _openslide_propagate_error(osr, tmp_err);
     if (dest) {
